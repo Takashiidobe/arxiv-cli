@@ -4,13 +4,14 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use std::io::prelude::*;
+use std::process::Command;
 use std::{collections::HashSet, fs::File};
 use std::{error::Error, io};
 use tui::{
     backend::{Backend, CrosstermBackend},
     layout::{Alignment, Constraint, Layout},
     style::{Color, Modifier, Style},
-    text::{Span, Text},
+    text::{Span, Spans, Text},
     widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState, Wrap},
     Frame, Terminal,
 };
@@ -54,8 +55,6 @@ const BASE_URL: &str = "https://arxiv-json-api.fly.dev";
 const FILE_PATH: &str = ".arxiv-cli";
 
 fn open_url(url: &str) {
-    use std::process::Command;
-
     Command::new("xdg-open")
         .arg(url)
         .output()
@@ -103,10 +102,10 @@ struct App {
     ids: HashSet<String>,
 }
 
-fn get_ids() -> HashSet<String> {
-    let home_dir = dirs::home_dir();
-    if let Some(home) = home_dir {
-        if let Ok(id) = std::fs::read_to_string(&format!("{}/{}", home.display(), FILE_PATH)) {
+async fn get_ids() -> HashSet<String> {
+    let read_arxiv_ids = dirs::cache_dir();
+    if let Some(arxiv_ids) = read_arxiv_ids {
+        if let Ok(id) = std::fs::read_to_string(&format!("{}/{}", arxiv_ids.display(), FILE_PATH)) {
             let mut ids = HashSet::default();
             for url in id.lines() {
                 ids.insert(url.to_string());
@@ -132,18 +131,18 @@ impl App {
 
     pub fn save_ids(&self) -> std::io::Result<()> {
         let mut s = String::from("");
-        let home_dir = dirs::home_dir();
-        if let Some(home) = home_dir {
-            let mut nyaa_file = File::options()
+        let read_arxiv_ids = dirs::cache_dir();
+        if let Some(arxiv_ids) = read_arxiv_ids {
+            let mut arxiv_file = File::options()
                 .create(true)
                 .write(true)
                 .truncate(true)
-                .open(&format!("{}/{}", home.display(), FILE_PATH))?;
+                .open(&format!("{}/{}", arxiv_ids.display(), FILE_PATH))?;
             for id in self.ids.iter() {
                 s.push_str(&format!("{}\n", id));
             }
 
-            write!(nyaa_file, "{}", s)?;
+            write!(arxiv_file, "{}", s)?;
         };
         Ok(())
     }
@@ -216,10 +215,10 @@ impl App {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let mut app = App::new();
-    app.set_ids(get_ids());
     let mut params = Params::new();
-    let items = get_items(&params).await?;
-    app.update_items(items);
+    let items = get_items(&params);
+    app.update_items(items.await?);
+    app.set_ids(get_ids().await);
 
     // setup terminal
     enable_raw_mode()?;
@@ -360,9 +359,44 @@ async fn run_app<B: Backend>(
                     let id = &app.items[app.current.unwrap_or(0)].id;
                     app.add_id(id.to_string());
                 }
-                KeyCode::Char('d') => {
+                KeyCode::Char('r') => {
                     let id = &app.items[app.current.unwrap_or(0)].id;
                     app.remove_id(id.to_string());
+                }
+                KeyCode::Char('d') => {
+                    let pdf_links = app.items[app.current.unwrap_or(0)]
+                        .links
+                        .iter()
+                        .find(|link| link.title == Some("pdf".to_string()));
+                    let home_dir = dirs::home_dir();
+
+                    if let (Some(link), Some(home)) = (pdf_links, home_dir) {
+                        let home_dir = home.display();
+                        let user_agent = "Mozilla/5.0 (X11; Linux x86_64; rv:104.0) Gecko/20100101 Firefox/104.0";
+                        let client = reqwest::Client::builder().user_agent(user_agent).build()?;
+                        let response = client.get(&link.href).send().await?;
+                        let file_name = response
+                            .url()
+                            .path_segments()
+                            .and_then(|segments| segments.last())
+                            .and_then(|name| if name.is_empty() { None } else { Some(name) })
+                            .unwrap_or("rand.pdf");
+
+                        let file_path = format!(
+                            "{}/{}",
+                            home_dir, "/monorepo/papers/papers/_papers-to-sort/"
+                        );
+
+                        use std::path::Path;
+                        let path = Path::new(&file_path);
+                        let joined_path = Path::join(path, file_name);
+                        let mut file = File::create(joined_path)?;
+
+                        let mut content = std::io::Cursor::new(response.bytes().await?);
+                        std::io::copy(&mut content, &mut file)?;
+                        let id = &app.items[app.current.unwrap_or(0)].id;
+                        app.add_id(id.to_string());
+                    }
                 }
                 _ => {}
             }
@@ -434,17 +468,23 @@ fn ui<B: Backend>(f: &mut Frame<B>, app: &mut App) {
 fn popup_ui<B: Backend>(f: &mut Frame<B>) {
     let size = f.size();
 
-    const HELP_TEXT: &str = "
-/ to search
-s to mark the current spot as viewed until
-<number> n to go to <number> pages next (like 5n to go 5 more pages)
-<number> p to go to <number> pages previous (like 5p to go 5 fewer pages)
-<number> j or down arrow to go down one item.
-<number> k or up arrow to up one item.
-o to open the selected item in the web browser.
-t to open up the selected item's HTML version (if it has one).
-";
-    let paragraph = Paragraph::new(Span::from(HELP_TEXT))
+    const HELP_TEXT: &[&str] = &[
+        "use `/` to search",
+        "use `s` to mark the current spot as viewed until",
+        "use `<number> n` to go to <number> pages next (like 5n to go 5 more pages)",
+        "use `<number> p` to go to <number> pages previous (like 5p to go 5 fewer pages)",
+        "use `<number> j` or down arrow to go down one item.",
+        "use `<number> k` or up arrow to up one item.",
+        "use `o` to open the selected item in the web browser.",
+        "use `t` to open up the selected item's HTML version (if it has one).",
+    ];
+
+    let help_text: Vec<_> = HELP_TEXT
+        .iter()
+        .map(|text| Spans::from(vec![Span::from(text.to_owned())]))
+        .collect();
+
+    let paragraph = Paragraph::new(help_text)
         .block(Block::default().borders(Borders::ALL))
         .alignment(Alignment::Left)
         .wrap(Wrap { trim: true });
